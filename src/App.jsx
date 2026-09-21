@@ -6,21 +6,17 @@ const MAX_VIDEO_SECONDS = 5 * 60;
 const day = (d) => d.toLocaleDateString("en-CA");
 
 // ============================================================
-// IndexedDB
+// IndexedDB — two separate databases
 // ============================================================
 
-const dbPromise = new Promise((res, rej) => {
+// --- StudyLapse DB: holds timelapse recordings ---
+const studyDb = new Promise((res, rej) => {
   const r = indexedDB.open("studylapse", 2);
 
   r.onupgradeneeded = () => {
     const database = r.result;
-
     if (!database.objectStoreNames.contains("v")) {
       database.createObjectStore("v", { keyPath: "id" });
-    }
-
-    if (!database.objectStoreNames.contains("funVideos")) {
-      database.createObjectStore("funVideos", { keyPath: "id" });
     }
   };
 
@@ -28,19 +24,58 @@ const dbPromise = new Promise((res, rej) => {
   r.onerror = () => rej(r.error);
 });
 
-const store = async (storeName, mode, fn) => {
+// --- VideoFun DB: separate database, its own store ---
+const funDb = new Promise((res, rej) => {
+  const r = indexedDB.open("videofun", 1);
+
+  r.onupgradeneeded = () => {
+    const database = r.result;
+    if (!database.objectStoreNames.contains("clips")) {
+      database.createObjectStore("clips", { keyPath: "id" });
+    }
+  };
+
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+
+// Generic store helper — takes the db promise so the two apps
+// are fully isolated from each other.
+const makeStore = (dbPromise) => async (storeName, mode, fn) => {
   const database = await dbPromise;
   const transaction = database.transaction(storeName, mode);
   const objectStore = transaction.objectStore(storeName);
 
   return new Promise((resolve, reject) => {
-    const request = fn(objectStore);
+    let result;
+    let requestError;
 
-    transaction.oncomplete = () => resolve(request.result);
-    transaction.onerror = () => reject(transaction.error);
-    transaction.onabort = () => reject(transaction.error);
+    try {
+      const request = fn(objectStore);
+      request.onsuccess = () => {
+        result = request.result;
+      };
+      request.onerror = () => {
+        requestError = request.error;
+      };
+    } catch (err) {
+      // Synchronous errors from fn() (e.g. bad key path)
+      transaction.abort();
+      reject(err);
+      return;
+    }
+
+    transaction.oncomplete = () => resolve(result);
+    transaction.onerror = () =>
+      reject(requestError || transaction.error);
+    transaction.onabort = () =>
+      reject(requestError || transaction.error);
   });
 };
+
+// StudyLapse store + VideoFun store
+const studyStore = makeStore(studyDb);
+const funStore = makeStore(funDb);
 
 // ============================================================
 // Main App
@@ -108,7 +143,7 @@ function StudyLapse() {
   const pausedRef = useRef(false);
 
   const load = useCallback(async () => {
-    const all = await store("v", "readonly", (s) => s.getAll());
+    const all = await studyStore("v", "readonly", (s) => s.getAll());
 
     setVideos((prev) => {
       prev.forEach((v) => v.url && URL.revokeObjectURL(v.url));
@@ -173,14 +208,11 @@ function StudyLapse() {
       setPaused(false);
       setN(0);
 
-      // Capture the very first frame once metadata is ready
-      const waitForMeta = () =>
-        new Promise((resolve) => {
-          if (video.current.videoWidth) return resolve();
-          video.current.onloadedmetadata = () => resolve();
-        });
+      await new Promise((resolve) => {
+        if (video.current.videoWidth) return resolve();
+        video.current.onloadedmetadata = () => resolve();
+      });
 
-      await waitForMeta();
       grabFrame();
 
       timer.current = setInterval(grabFrame, SEC * 1000);
@@ -209,8 +241,8 @@ function StudyLapse() {
     c.height = first.height;
 
     const ctx = c.getContext("2d");
-
     const stream = c.captureStream(15);
+
     const rec = new MediaRecorder(stream, {
       mimeType: MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
         ? "video/webm;codecs=vp9"
@@ -223,8 +255,9 @@ function StudyLapse() {
       if (e.data.size) chunks.push(e.data);
     };
 
-    const done = new Promise((resolve) => {
+    const done = new Promise((resolve, reject) => {
       rec.onstop = resolve;
+      rec.onerror = (e) => reject(e.error || new Error("Recorder error"));
     });
 
     rec.start();
@@ -266,7 +299,7 @@ function StudyLapse() {
 
       const blob = await render();
 
-      await store("v", "readwrite", (s) =>
+      await studyStore("v", "readwrite", (s) =>
         s.put({
           id: Date.now(),
           title: `${new Date().toLocaleString()} • ${mins} min`,
@@ -296,7 +329,7 @@ function StudyLapse() {
 
     URL.revokeObjectURL(v.url);
 
-    await store("v", "readwrite", (s) => s.delete(v.id));
+    await studyStore("v", "readwrite", (s) => s.delete(v.id));
 
     load();
   }
@@ -496,7 +529,7 @@ function VideoFun() {
   const pausedRef = useRef(false);
 
   const loadVideos = useCallback(async () => {
-    const all = await store("funVideos", "readonly", (s) => s.getAll());
+    const all = await funStore("clips", "readonly", (s) => s.getAll());
 
     setVideos((prev) => {
       prev.forEach((v) => v.url && URL.revokeObjectURL(v.url));
@@ -514,12 +547,10 @@ function VideoFun() {
     return () => {
       clearInterval(timerRef.current);
 
-      if (
-        recorderRef.current &&
-        recorderRef.current.state !== "inactive"
-      ) {
+      const rec = recorderRef.current;
+      if (rec && rec.state !== "inactive") {
         try {
-          recorderRef.current.stop();
+          rec.stop();
         } catch {
           /* ignore */
         }
@@ -539,6 +570,16 @@ function VideoFun() {
     ];
 
     return types.find((t) => MediaRecorder.isTypeSupported(t)) || "";
+  }
+
+  function cleanupStream() {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    if (preview.current) {
+      preview.current.srcObject = null;
+    }
   }
 
   async function startRecording() {
@@ -579,9 +620,16 @@ function VideoFun() {
       pausedRef.current = false;
 
       recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
+        if (event.data && event.data.size > 0) {
           chunksRef.current.push(event.data);
         }
+      };
+
+      recorder.onerror = (event) => {
+        console.error("MediaRecorder error:", event.error);
+        setStatus(
+          "Recorder error: " + (event.error?.message || "unknown")
+        );
       };
 
       recorder.onstop = async () => {
@@ -590,25 +638,37 @@ function VideoFun() {
             type: recorder.mimeType || "video/webm",
           });
 
+          if (!blob.size) {
+            throw new Error(
+              "Recording produced an empty file. Try recording a bit longer."
+            );
+          }
+
           const id = Date.now();
 
-          await store("funVideos", "readwrite", (s) =>
+          await funStore("clips", "readwrite", (s) =>
             s.put({
               id,
               title: `VideoFun • ${new Date().toLocaleString()}`,
               duration: secondsRef.current,
+              size: blob.size,
               blob,
             })
           );
 
-          setStatus("Video saved to this browser ✨");
+          setStatus("Video saved ✨");
           await loadVideos();
         } catch (err) {
+          console.error("VideoFun save failed:", err);
           setStatus("Save failed: " + err.message);
+        } finally {
+          cleanupStream();
+          setRecording(false);
+          setPaused(false);
+          recorderRef.current = null;
         }
       };
 
-      // Request data in 1s slices — MediaRecorder handles pause/resume
       recorder.start(1000);
 
       setSeconds(0);
@@ -627,6 +687,7 @@ function VideoFun() {
       }, 1000);
     } catch (e) {
       setStatus("Could not start camera: " + e.message);
+      cleanupStream();
     }
   }
 
@@ -645,6 +706,9 @@ function VideoFun() {
     }
   }
 
+  // Only tells the recorder to stop. The onstop handler takes care of
+  // stopping tracks and saving the blob — that way the final chunk
+  // gets flushed before we tear the stream down.
   function stopRecording() {
     clearInterval(timerRef.current);
     pausedRef.current = false;
@@ -653,19 +717,12 @@ function VideoFun() {
 
     if (rec && rec.state !== "inactive") {
       rec.stop();
+    } else {
+      // Nothing to save — clean up immediately.
+      cleanupStream();
+      setRecording(false);
+      setPaused(false);
     }
-
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-
-    if (preview.current) {
-      preview.current.srcObject = null;
-    }
-
-    setRecording(false);
-    setPaused(false);
   }
 
   async function deleteVideo(video) {
@@ -673,7 +730,7 @@ function VideoFun() {
 
     URL.revokeObjectURL(video.url);
 
-    await store("funVideos", "readwrite", (s) => s.delete(video.id));
+    await funStore("clips", "readwrite", (s) => s.delete(video.id));
 
     await loadVideos();
   }
@@ -686,6 +743,13 @@ function VideoFun() {
       2,
       "0"
     )}`;
+  }
+
+  function formatSize(bytes) {
+    if (!bytes) return "—";
+    const mb = bytes / (1024 * 1024);
+    if (mb >= 1) return `${mb.toFixed(1)} MB`;
+    return `${(bytes / 1024).toFixed(0)} KB`;
   }
 
   return (
@@ -764,7 +828,7 @@ function VideoFun() {
           <div>
             <h2>Your VideoFun Videos</h2>
             <p className="section-description">
-              Stored locally on this browser.
+              Stored locally in the <code>videofun</code> database.
             </p>
           </div>
 
@@ -790,7 +854,7 @@ function VideoFun() {
                   <span className="card-title">{v.title}</span>
 
                   <span className="video-duration">
-                    {formatTime(v.duration || 0)}
+                    {formatTime(v.duration || 0)} • {formatSize(v.size)}
                   </span>
 
                   <div className="card-actions">
@@ -1289,6 +1353,13 @@ h2 {
   margin: 0;
   font-size: 13px;
   color: var(--muted);
+}
+
+.section-description code {
+  background: var(--line);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 12px;
 }
 
 .video-count {
