@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 
 const SEC = 5;
 const MAX_VIDEO_SECONDS = 5 * 60;
@@ -9,7 +9,7 @@ const day = (d) => d.toLocaleDateString("en-CA");
 // IndexedDB
 // ============================================================
 
-const db = new Promise((res, rej) => {
+const dbPromise = new Promise((res, rej) => {
   const r = indexedDB.open("studylapse", 2);
 
   r.onupgradeneeded = () => {
@@ -29,16 +29,16 @@ const db = new Promise((res, rej) => {
 });
 
 const store = async (storeName, mode, fn) => {
-  const database = await db;
-  const transaction = database
-    .transaction(storeName, mode)
-    .objectStore(storeName);
+  const database = await dbPromise;
+  const transaction = database.transaction(storeName, mode);
+  const objectStore = transaction.objectStore(storeName);
 
   return new Promise((resolve, reject) => {
-    const request = fn(transaction);
+    const request = fn(objectStore);
 
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    transaction.oncomplete = () => resolve(request.result);
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
   });
 };
 
@@ -98,25 +98,26 @@ function StudyLapse() {
 
   const [status, setStatus] = useState("");
   const [recording, setRecording] = useState(false);
+  const [paused, setPaused] = useState(false);
   const [screen, setScreen] = useState(false);
   const [n, setN] = useState(0);
 
   const video = useRef();
   const frames = useRef([]);
   const timer = useRef();
+  const pausedRef = useRef(false);
 
-  async function load() {
+  const load = useCallback(async () => {
     const all = await store("v", "readonly", (s) => s.getAll());
 
-    setVideos(
-      all
-        .reverse()
-        .map((v) => ({
-          ...v,
-          url: URL.createObjectURL(v.blob),
-        }))
-    );
-  }
+    setVideos((prev) => {
+      prev.forEach((v) => v.url && URL.revokeObjectURL(v.url));
+      return all.reverse().map((v) => ({
+        ...v,
+        url: URL.createObjectURL(v.blob),
+      }));
+    });
+  }, []);
 
   useEffect(() => {
     load();
@@ -125,6 +126,34 @@ function StudyLapse() {
     return () => {
       clearInterval(timer.current);
     };
+  }, [load]);
+
+  const grabFrame = useCallback(() => {
+    if (pausedRef.current) return;
+    if (!video.current || !video.current.videoWidth) return;
+
+    const c = document.createElement("canvas");
+    c.width = video.current.videoWidth;
+    c.height = video.current.videoHeight;
+
+    c.getContext("2d").drawImage(
+      video.current,
+      0,
+      0,
+      c.width,
+      c.height
+    );
+
+    c.toBlob(
+      (b) => {
+        if (b) {
+          frames.current.push(b);
+          setN(frames.current.length);
+        }
+      },
+      "image/jpeg",
+      0.7
+    );
   }, []);
 
   async function start() {
@@ -140,43 +169,32 @@ function StudyLapse() {
       await video.current.play();
 
       frames.current = [];
+      pausedRef.current = false;
+      setPaused(false);
       setN(0);
 
-      const c = document.createElement("canvas");
+      // Capture the very first frame once metadata is ready
+      const waitForMeta = () =>
+        new Promise((resolve) => {
+          if (video.current.videoWidth) return resolve();
+          video.current.onloadedmetadata = () => resolve();
+        });
 
-      const grab = () => {
-        if (!video.current.videoWidth) return;
+      await waitForMeta();
+      grabFrame();
 
-        c.width = video.current.videoWidth;
-        c.height = video.current.videoHeight;
-
-        c.getContext("2d").drawImage(
-          video.current,
-          0,
-          0,
-          c.width,
-          c.height
-        );
-
-        c.toBlob(
-          (b) => {
-            if (b) frames.current.push(b);
-          },
-          "image/jpeg",
-          0.7
-        );
-
-        setN((x) => x + 1);
-      };
-
-      grab();
-
-      timer.current = setInterval(grab, SEC * 1000);
+      timer.current = setInterval(grabFrame, SEC * 1000);
 
       setRecording(true);
+      setStatus("");
     } catch (e) {
       setStatus("Could not start recording: " + e.message);
     }
+  }
+
+  function togglePause() {
+    pausedRef.current = !pausedRef.current;
+    setPaused(pausedRef.current);
   }
 
   async function render() {
@@ -187,14 +205,16 @@ function StudyLapse() {
     const first = await createImageBitmap(frames.current[0]);
 
     const c = document.createElement("canvas");
-
     c.width = first.width;
     c.height = first.height;
 
     const ctx = c.getContext("2d");
 
-    const rec = new MediaRecorder(c.captureStream(15), {
-      mimeType: "video/webm",
+    const stream = c.captureStream(15);
+    const rec = new MediaRecorder(stream, {
+      mimeType: MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
+        ? "video/webm;codecs=vp9"
+        : "video/webm",
     });
 
     const chunks = [];
@@ -209,37 +229,32 @@ function StudyLapse() {
 
     rec.start();
 
-    for (const f of frames.current) {
-      const bitmap = await createImageBitmap(f);
-
+    for (let i = 0; i < frames.current.length; i++) {
+      const bitmap = await createImageBitmap(frames.current[i]);
       ctx.drawImage(bitmap, 0, 0);
-
       bitmap.close();
-
       await new Promise((r) => setTimeout(r, 67));
     }
 
     rec.stop();
+    first.close();
 
     await done;
 
-    return new Blob(chunks, {
-      type: "video/webm",
-    });
+    return new Blob(chunks, { type: "video/webm" });
   }
 
   async function stop() {
     clearInterval(timer.current);
+    pausedRef.current = false;
 
     if (video.current?.srcObject) {
-      video.current.srcObject
-        .getTracks()
-        .forEach((t) => t.stop());
-
+      video.current.srcObject.getTracks().forEach((t) => t.stop());
       video.current.srcObject = null;
     }
 
     setRecording(false);
+    setPaused(false);
 
     try {
       const mins = Math.max(
@@ -247,7 +262,7 @@ function StudyLapse() {
         Math.round((frames.current.length * SEC) / 60)
       );
 
-      setStatus("Building video... keep this tab in front.");
+      setStatus("Building video… keep this tab in front.");
 
       const blob = await render();
 
@@ -261,25 +276,15 @@ function StudyLapse() {
 
       const nextStats = {
         xp: stats.xp + mins * 10,
-        days: [
-          ...new Set([
-            ...stats.days,
-            day(new Date()),
-          ]),
-        ],
+        days: [...new Set([...stats.days, day(new Date())])],
       };
 
       setStats(nextStats);
+      localStorage.setItem("stats", JSON.stringify(nextStats));
 
-      localStorage.setItem(
-        "stats",
-        JSON.stringify(nextStats)
-      );
+      setStatus(`Saved! +${mins * 10} XP gained ✨`);
 
-      setStatus(
-        `Saved! +${mins * 10} XP gained ✨`
-      );
-
+      frames.current = [];
       load();
     } catch (e) {
       setStatus("Error: " + e.message);
@@ -291,23 +296,15 @@ function StudyLapse() {
 
     URL.revokeObjectURL(v.url);
 
-    await store("v", "readwrite", (s) =>
-      s.delete(v.id)
-    );
+    await store("v", "readwrite", (s) => s.delete(v.id));
 
     load();
   }
 
-  const level =
-    Math.floor(Math.sqrt(stats.xp / 100)) + 1;
-
-  const [lo, hi] = [
-    100 * (level - 1) ** 2,
-    100 * level ** 2,
-  ];
+  const level = Math.floor(Math.sqrt(stats.xp / 100)) + 1;
+  const [lo, hi] = [100 * (level - 1) ** 2, 100 * level ** 2];
 
   let streak = 0;
-
   const d = new Date();
 
   if (!stats.days.includes(day(d))) {
@@ -321,11 +318,10 @@ function StudyLapse() {
 
   const progressPercent = Math.min(
     100,
-    Math.max(
-      0,
-      ((stats.xp - lo) / (hi - lo)) * 100
-    )
+    Math.max(0, ((stats.xp - lo) / (hi - lo)) * 100)
   );
+
+  const studiedMinutes = Math.round((n * SEC) / 60);
 
   return (
     <main>
@@ -339,27 +335,19 @@ function StudyLapse() {
       <section className="stats-card">
         <div className="stats-row">
           <div className="stat-item highlight">
-            <span className="stat-label">
-              Level
-            </span>
-            <span className="stat-value">
-              {level}
-            </span>
+            <span className="stat-label">Level</span>
+            <span className="stat-value">{level}</span>
           </div>
 
           <div className="stat-item">
-            <span className="stat-label">
-              Total XP
-            </span>
+            <span className="stat-label">Total XP</span>
             <span className="stat-value">
               {stats.xp.toLocaleString()}
             </span>
           </div>
 
           <div className="stat-item">
-            <span className="stat-label">
-              Current Streak
-            </span>
+            <span className="stat-label">Current Streak</span>
             <span className="stat-value">
               {streak} <small>days</small>
             </span>
@@ -368,21 +356,14 @@ function StudyLapse() {
 
         <div className="progress-container">
           <div className="progress-header">
-            <span>
-              Level {level} Progress
-            </span>
-
+            <span>Level {level} Progress</span>
             <span>
               {stats.xp - lo} / {hi - lo} XP
             </span>
           </div>
 
           <div className="bar">
-            <i
-              style={{
-                width: `${progressPercent}%`,
-              }}
-            />
+            <i style={{ width: `${progressPercent}%` }} />
           </div>
         </div>
       </section>
@@ -390,40 +371,38 @@ function StudyLapse() {
       <section className="studio-card">
         <div
           className="video-container"
-          style={{
-            display: recording ? "block" : "none",
-          }}
+          style={{ display: recording ? "block" : "none" }}
         >
-          <div className="live-badge">
+          <div className={`live-badge ${paused ? "paused" : ""}`}>
             <span className="pulse-dot" />
-            LIVE RECORDING
+            {paused ? "PAUSED" : "LIVE RECORDING"}
           </div>
 
-          <video
-            ref={video}
-            muted
-            playsInline
-          />
+          <video ref={video} muted playsInline />
         </div>
 
         <div className="controls">
           {recording ? (
             <div className="recording-status">
               <div className="time-counter">
-                <span>
-                  {Math.round(
-                    (n * SEC) / 60
-                  )}
-                </span>{" "}
-                min studied
+                <span>{studiedMinutes}</span> min studied
               </div>
 
-              <button
-                className="btn btn-primary btn-stop"
-                onClick={stop}
-              >
-                Finish & Save Session
-              </button>
+              <div className="button-row">
+                <button
+                  className="btn btn-outline"
+                  onClick={togglePause}
+                >
+                  {paused ? "Resume" : "Pause"}
+                </button>
+
+                <button
+                  className="btn btn-primary btn-stop"
+                  onClick={stop}
+                >
+                  Finish &amp; Save
+                </button>
+              </div>
             </div>
           ) : (
             <div className="setup-status">
@@ -431,13 +410,9 @@ function StudyLapse() {
                 <input
                   type="checkbox"
                   checked={screen}
-                  onChange={(e) =>
-                    setScreen(e.target.checked)
-                  }
+                  onChange={(e) => setScreen(e.target.checked)}
                 />
-
                 <span className="toggle-switch" />
-
                 Record screen instead of camera
               </label>
 
@@ -451,11 +426,7 @@ function StudyLapse() {
           )}
         </div>
 
-        {status && (
-          <div className="status-toast">
-            {status}
-          </div>
-        )}
+        {status && <div className="status-toast">{status}</div>}
       </section>
 
       <section className="timelapses-section">
@@ -463,33 +434,21 @@ function StudyLapse() {
 
         {videos.length === 0 ? (
           <div className="empty-state">
-            <p>
-              No study sessions recorded yet.
-            </p>
-
+            <p>No study sessions recorded yet.</p>
             <small>
-              Click "Start Studying" above to
-              produce your first timelapse.
+              Click "Start Studying" above to produce your first timelapse.
             </small>
           </div>
         ) : (
           <div className="grid">
             {videos.map((v) => (
-              <div
-                key={v.id}
-                className="video-card"
-              >
+              <div key={v.id} className="video-card">
                 <div className="video-wrapper">
-                  <video
-                    src={v.url}
-                    controls
-                  />
+                  <video src={v.url} controls />
                 </div>
 
                 <div className="card-body">
-                  <span className="card-title">
-                    {v.title}
-                  </span>
+                  <span className="card-title">{v.title}</span>
 
                   <div className="card-actions">
                     <a
@@ -524,6 +483,7 @@ function StudyLapse() {
 function VideoFun() {
   const [videos, setVideos] = useState([]);
   const [recording, setRecording] = useState(false);
+  const [paused, setPaused] = useState(false);
   const [seconds, setSeconds] = useState(0);
   const [status, setStatus] = useState("");
 
@@ -532,21 +492,20 @@ function VideoFun() {
   const recorderRef = useRef(null);
   const chunksRef = useRef([]);
   const timerRef = useRef(null);
+  const secondsRef = useRef(0);
+  const pausedRef = useRef(false);
 
-  async function loadVideos() {
-    const all = await store(
-      "funVideos",
-      "readonly",
-      (s) => s.getAll()
-    );
+  const loadVideos = useCallback(async () => {
+    const all = await store("funVideos", "readonly", (s) => s.getAll());
 
-    setVideos(
-      all.reverse().map((v) => ({
+    setVideos((prev) => {
+      prev.forEach((v) => v.url && URL.revokeObjectURL(v.url));
+      return all.reverse().map((v) => ({
         ...v,
         url: URL.createObjectURL(v.blob),
-      }))
-    );
-  }
+      }));
+    });
+  }, []);
 
   useEffect(() => {
     loadVideos();
@@ -555,13 +514,22 @@ function VideoFun() {
     return () => {
       clearInterval(timerRef.current);
 
+      if (
+        recorderRef.current &&
+        recorderRef.current.state !== "inactive"
+      ) {
+        try {
+          recorderRef.current.stop();
+        } catch {
+          /* ignore */
+        }
+      }
+
       if (streamRef.current) {
-        streamRef.current
-          .getTracks()
-          .forEach((track) => track.stop());
+        streamRef.current.getTracks().forEach((t) => t.stop());
       }
     };
-  }, []);
+  }, [loadVideos]);
 
   function getSupportedMimeType() {
     const types = [
@@ -570,49 +538,34 @@ function VideoFun() {
       "video/webm",
     ];
 
-    return (
-      types.find((type) =>
-        MediaRecorder.isTypeSupported(type)
-      ) || ""
-    );
+    return types.find((t) => MediaRecorder.isTypeSupported(t)) || "";
   }
 
   async function startRecording() {
     try {
       setStatus("");
 
-      if (
-        !navigator.mediaDevices ||
-        !navigator.mediaDevices.getUserMedia
-      ) {
+      if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error(
           "Camera recording is not supported by this browser."
         );
       }
 
-      const stream =
-        await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: {
-              ideal: 1920,
-            },
-            height: {
-              ideal: 1080,
-            },
-            facingMode: "user",
-          },
-          audio: true,
-        });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          facingMode: "user",
+        },
+        audio: true,
+      });
 
       streamRef.current = stream;
 
       preview.current.srcObject = stream;
-
       await preview.current.play();
 
-      const mimeType =
-        getSupportedMimeType();
-
+      const mimeType = getSupportedMimeType();
       const recorder = mimeType
         ? new MediaRecorder(stream, {
             mimeType,
@@ -622,6 +575,8 @@ function VideoFun() {
 
       recorderRef.current = recorder;
       chunksRef.current = [];
+      secondsRef.current = 0;
+      pausedRef.current = false;
 
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
@@ -630,79 +585,78 @@ function VideoFun() {
       };
 
       recorder.onstop = async () => {
-        const blob = new Blob(
-          chunksRef.current,
-          {
-            type:
-              recorder.mimeType ||
-              "video/webm",
-          }
-        );
+        try {
+          const blob = new Blob(chunksRef.current, {
+            type: recorder.mimeType || "video/webm",
+          });
 
-        const id = Date.now();
+          const id = Date.now();
 
-        await store(
-          "funVideos",
-          "readwrite",
-          (s) =>
+          await store("funVideos", "readwrite", (s) =>
             s.put({
               id,
               title: `VideoFun • ${new Date().toLocaleString()}`,
-              duration: seconds,
+              duration: secondsRef.current,
               blob,
             })
-        );
+          );
 
-        setStatus(
-          "Video saved to this browser ✨"
-        );
-
-        await loadVideos();
+          setStatus("Video saved to this browser ✨");
+          await loadVideos();
+        } catch (err) {
+          setStatus("Save failed: " + err.message);
+        }
       };
 
+      // Request data in 1s slices — MediaRecorder handles pause/resume
       recorder.start(1000);
 
       setSeconds(0);
+      setPaused(false);
       setRecording(true);
 
       timerRef.current = setInterval(() => {
-        setSeconds((current) => {
-          const next = current + 1;
+        if (pausedRef.current) return;
 
-          if (
-            next >= MAX_VIDEO_SECONDS
-          ) {
-            setTimeout(() => {
-              stopRecording();
-            }, 0);
-          }
+        secondsRef.current += 1;
+        setSeconds(secondsRef.current);
 
-          return next;
-        });
+        if (secondsRef.current >= MAX_VIDEO_SECONDS) {
+          stopRecording();
+        }
       }, 1000);
     } catch (e) {
-      setStatus(
-        "Could not start camera: " +
-          e.message
-      );
+      setStatus("Could not start camera: " + e.message);
+    }
+  }
+
+  function togglePause() {
+    const rec = recorderRef.current;
+    if (!rec) return;
+
+    if (rec.state === "recording") {
+      rec.pause();
+      pausedRef.current = true;
+      setPaused(true);
+    } else if (rec.state === "paused") {
+      rec.resume();
+      pausedRef.current = false;
+      setPaused(false);
     }
   }
 
   function stopRecording() {
     clearInterval(timerRef.current);
+    pausedRef.current = false;
 
-    if (
-      recorderRef.current &&
-      recorderRef.current.state !== "inactive"
-    ) {
-      recorderRef.current.stop();
+    const rec = recorderRef.current;
+
+    if (rec && rec.state !== "inactive") {
+      rec.stop();
     }
 
     if (streamRef.current) {
-      streamRef.current
-        .getTracks()
-        .forEach((track) => track.stop());
-
+      streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
 
@@ -711,49 +665,35 @@ function VideoFun() {
     }
 
     setRecording(false);
+    setPaused(false);
   }
 
   async function deleteVideo(video) {
-    if (
-      !confirm(
-        "Delete this VideoFun recording?"
-      )
-    ) {
-      return;
-    }
+    if (!confirm("Delete this VideoFun recording?")) return;
 
     URL.revokeObjectURL(video.url);
 
-    await store(
-      "funVideos",
-      "readwrite",
-      (s) => s.delete(video.id)
-    );
+    await store("funVideos", "readwrite", (s) => s.delete(video.id));
 
     await loadVideos();
   }
 
   function formatTime(totalSeconds) {
-    const mins = Math.floor(
-      totalSeconds / 60
-    );
-
+    const mins = Math.floor(totalSeconds / 60);
     const secs = totalSeconds % 60;
 
-    return `${String(mins).padStart(
+    return `${String(mins).padStart(2, "0")}:${String(secs).padStart(
       2,
       "0"
-    )}:${String(secs).padStart(2, "0")}`;
+    )}`;
   }
 
   return (
     <main>
       <header className="brand-header">
         <h1>VideoFun</h1>
-
         <p className="subtitle">
-          Record short videos and keep them
-          privately in this browser.
+          Record short videos and keep them privately in this browser.
         </p>
       </header>
 
@@ -763,17 +703,12 @@ function VideoFun() {
         <h2>Make a Video</h2>
 
         <p>
-          Record a video up to 5 minutes long.
-          Your recording stays in this browser
-          unless you download it.
+          Record a video up to 5 minutes long. Your recording stays in
+          this browser unless you download it.
         </p>
 
         <div className="video-container fun-preview">
-          <video
-            ref={preview}
-            muted
-            playsInline
-          />
+          <video ref={preview} muted playsInline />
 
           {!recording && (
             <div className="preview-placeholder">
@@ -782,22 +717,17 @@ function VideoFun() {
           )}
 
           {recording && (
-            <div className="live-badge">
+            <div className={`live-badge ${paused ? "paused" : ""}`}>
               <span className="pulse-dot" />
-              RECORDING
+              {paused ? "PAUSED" : "RECORDING"}
             </div>
           )}
         </div>
 
         <div className="fun-controls">
           <div className="fun-timer">
-            <span>
-              {formatTime(seconds)}
-            </span>
-
-            <small>
-              / 05:00
-            </small>
+            <span>{formatTime(seconds)}</span>
+            <small>/ 05:00</small>
           </div>
 
           {!recording ? (
@@ -808,20 +738,25 @@ function VideoFun() {
               Start Video
             </button>
           ) : (
-            <button
-              className="btn btn-stop btn-large"
-              onClick={stopRecording}
-            >
-              Stop & Save
-            </button>
+            <div className="button-row">
+              <button
+                className="btn btn-outline btn-large"
+                onClick={togglePause}
+              >
+                {paused ? "Resume" : "Pause"}
+              </button>
+
+              <button
+                className="btn btn-stop btn-large"
+                onClick={stopRecording}
+              >
+                Stop &amp; Save
+              </button>
+            </div>
           )}
         </div>
 
-        {status && (
-          <div className="status-toast">
-            {status}
-          </div>
-        )}
+        {status && <div className="status-toast">{status}</div>}
       </section>
 
       <section className="timelapses-section">
@@ -834,46 +769,28 @@ function VideoFun() {
           </div>
 
           <span className="video-count">
-            {videos.length}{" "}
-            {videos.length === 1
-              ? "video"
-              : "videos"}
+            {videos.length} {videos.length === 1 ? "video" : "videos"}
           </span>
         </div>
 
         {videos.length === 0 ? (
           <div className="empty-state">
-            <p>
-              No VideoFun videos yet.
-            </p>
-
-            <small>
-              Record your first short video
-              above.
-            </small>
+            <p>No VideoFun videos yet.</p>
+            <small>Record your first short video above.</small>
           </div>
         ) : (
           <div className="grid">
             {videos.map((v) => (
-              <div
-                key={v.id}
-                className="video-card"
-              >
+              <div key={v.id} className="video-card">
                 <div className="video-wrapper">
-                  <video
-                    src={v.url}
-                    controls
-                    preload="metadata"
-                  />
+                  <video src={v.url} controls preload="metadata" />
                 </div>
 
                 <div className="card-body">
-                  <span className="card-title">
-                    {v.title}
-                  </span>
+                  <span className="card-title">{v.title}</span>
 
                   <span className="video-duration">
-                    {formatTime(v.duration)}
+                    {formatTime(v.duration || 0)}
                   </span>
 
                   <div className="card-actions">
@@ -887,9 +804,7 @@ function VideoFun() {
 
                     <button
                       className="btn btn-sm btn-danger"
-                      onClick={() =>
-                        deleteVideo(v)
-                      }
+                      onClick={() => deleteVideo(v)}
                     >
                       Delete
                     </button>
@@ -925,9 +840,7 @@ const css = `
   --danger-glow: rgba(229, 107, 107, 0.15);
 }
 
-* {
-  box-sizing: border-box;
-}
+* { box-sizing: border-box; }
 
 body {
   margin: 0;
@@ -937,9 +850,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* ============================================================
-   Navigation
-   ============================================================ */
+/* ============================ Navigation ============================ */
 
 .top-nav {
   position: sticky;
@@ -975,14 +886,12 @@ body {
   font-weight: 600;
 }
 
-.nav-links {
-  display: flex;
-  gap: 6px;
-}
+.nav-links { display: flex; gap: 6px; }
 
 .nav-link {
   padding: 7px 13px;
   border-radius: 999px;
+  transition: background .15s, color .15s;
 }
 
 .nav-link:hover {
@@ -995,9 +904,7 @@ body {
   background: var(--accent);
 }
 
-/* ============================================================
-   Layout
-   ============================================================ */
+/* ============================ Layout ============================ */
 
 main {
   max-width: 820px;
@@ -1005,9 +912,7 @@ main {
   padding: 64px 24px;
 }
 
-.brand-header {
-  margin-bottom: 32px;
-}
+.brand-header { margin-bottom: 32px; }
 
 h1 {
   font: 600 48px/1.1 "Cormorant Garamond", Georgia, serif;
@@ -1015,20 +920,14 @@ h1 {
   margin: 0 0 6px;
 }
 
-.subtitle {
-  margin: 0;
-  color: var(--muted);
-  font-size: 15px;
-}
+.subtitle { margin: 0; color: var(--muted); font-size: 15px; }
 
 h2 {
   font: 500 28px "Cormorant Garamond", Georgia, serif;
   margin: 0 0 20px;
 }
 
-/* ============================================================
-   Stats
-   ============================================================ */
+/* ============================ Stats ============================ */
 
 .stats-card {
   background: var(--panel);
@@ -1046,10 +945,7 @@ h2 {
   border-bottom: 1px solid var(--line);
 }
 
-.stat-item {
-  display: flex;
-  flex-direction: column;
-}
+.stat-item { display: flex; flex-direction: column; }
 
 .stat-label {
   font-size: 12px;
@@ -1074,11 +970,7 @@ h2 {
   font-family: Inter, sans-serif;
 }
 
-.progress-container {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
+.progress-container { display: flex; flex-direction: column; gap: 8px; }
 
 .progress-header {
   display: flex;
@@ -1097,17 +989,12 @@ h2 {
 .bar i {
   display: block;
   height: 100%;
-  background: linear-gradient(
-    90deg,
-    var(--accent),
-    #ede0be
-  );
+  background: linear-gradient(90deg, var(--accent), #ede0be);
   border-radius: 999px;
+  transition: width .3s ease;
 }
 
-/* ============================================================
-   Studio
-   ============================================================ */
+/* ============================ Studio / Fun hero ============================ */
 
 .studio-card,
 .fun-hero {
@@ -1132,6 +1019,7 @@ h2 {
   width: 100%;
   aspect-ratio: 16/9;
   object-fit: cover;
+  background: #000;
 }
 
 .live-badge {
@@ -1153,6 +1041,14 @@ h2 {
   letter-spacing: .05em;
 }
 
+.live-badge.paused { color: var(--accent); }
+
+.live-badge.paused .pulse-dot {
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+  animation: none;
+}
+
 .pulse-dot {
   width: 8px;
   height: 8px;
@@ -1163,20 +1059,9 @@ h2 {
 }
 
 @keyframes pulse {
-  0% {
-    opacity: 1;
-    transform: scale(1);
-  }
-
-  50% {
-    opacity: .4;
-    transform: scale(.8);
-  }
-
-  100% {
-    opacity: 1;
-    transform: scale(1);
-  }
+  0%   { opacity: 1; transform: scale(1); }
+  50%  { opacity: .4; transform: scale(.8); }
+  100% { opacity: 1; transform: scale(1); }
 }
 
 .controls {
@@ -1192,12 +1077,16 @@ h2 {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+  flex-wrap: wrap;
 }
 
-.time-counter {
-  font-size: 16px;
-  color: var(--muted);
+.button-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
 }
+
+.time-counter { font-size: 16px; color: var(--muted); }
 
 .time-counter span {
   font-weight: 600;
@@ -1205,13 +1094,113 @@ h2 {
   font-size: 20px;
 }
 
-/* ============================================================
-   VideoFun
-   ============================================================ */
+/* ============================ Buttons ============================ */
 
-.fun-hero {
-  margin-bottom: 48px;
+.btn {
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 10px 18px;
+  font: 500 14px Inter, sans-serif;
+  cursor: pointer;
+  transition: background .15s, color .15s, border-color .15s, transform .1s;
 }
+
+.btn:active { transform: translateY(1px); }
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+  box-shadow: 0 0 0 4px var(--accent-glow);
+}
+
+.btn-outline {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--line);
+}
+
+.btn-outline:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn-stop {
+  background: var(--danger);
+  color: white;
+  font-weight: 600;
+}
+
+.btn-stop:hover {
+  background: #f07a7a;
+  box-shadow: 0 0 0 4px var(--danger-glow);
+}
+
+.btn-danger {
+  background: transparent;
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.btn-danger:hover {
+  background: var(--danger);
+  color: white;
+}
+
+.btn-sm { padding: 6px 12px; font-size: 13px; }
+.btn-large { padding: 12px 22px; font-size: 15px; }
+
+.btn-start { min-width: 160px; }
+
+/* ============================ Toggle ============================ */
+
+.toggle-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--muted);
+  user-select: none;
+}
+
+.toggle-label input { display: none; }
+
+.toggle-switch {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  background: var(--line);
+  border-radius: 999px;
+  transition: background .15s;
+}
+
+.toggle-switch::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  background: var(--text);
+  border-radius: 50%;
+  transition: transform .15s;
+}
+
+.toggle-label input:checked + .toggle-switch {
+  background: var(--accent);
+}
+
+.toggle-label input:checked + .toggle-switch::after {
+  transform: translateX(16px);
+  background: var(--bg);
+}
+
+/* ============================ VideoFun ============================ */
 
 .fun-icon {
   width: 52px;
@@ -1220,4 +1209,174 @@ h2 {
   align-items: center;
   justify-content: center;
   border-radius: 50%;
-  background: var(--accent);`
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 18px;
+  margin-bottom: 12px;
+}
+
+.fun-hero p {
+  color: var(--muted);
+  margin: 0 0 20px;
+}
+
+.fun-preview {
+  position: relative;
+  margin-bottom: 20px;
+}
+
+.preview-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 14px;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+.fun-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.fun-timer {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font: 600 24px/1 "Cormorant Garamond", Georgia, serif;
+  color: var(--text);
+}
+
+.fun-timer small {
+  font: 400 14px Inter, sans-serif;
+  color: var(--muted);
+}
+
+/* ============================ Status ============================ */
+
+.status-toast {
+  margin-top: 16px;
+  padding: 10px 14px;
+  background: rgba(217, 195, 143, .08);
+  border: 1px solid rgba(217, 195, 143, .25);
+  border-radius: 10px;
+  color: var(--accent);
+  font-size: 14px;
+}
+
+/* ============================ Video list ============================ */
+
+.timelapses-section { margin-top: 24px; }
+
+.section-heading-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.section-heading-row h2 { margin-bottom: 4px; }
+
+.section-description {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.video-count {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.empty-state {
+  background: var(--panel);
+  border: 1px dashed var(--line);
+  border-radius: 16px;
+  padding: 40px 24px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.empty-state p { margin: 0 0 6px; color: var(--text); }
+.empty-state small { font-size: 13px; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 16px;
+}
+
+.video-card {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.video-wrapper {
+  background: #000;
+  aspect-ratio: 16/9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.video-wrapper video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.card-body {
+  padding: 12px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.card-title {
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.video-duration {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.card-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.card-actions .btn { flex: 1; text-align: center; text-decoration: none; }
+
+/* ============================ Responsive ============================ */
+
+@media (max-width: 600px) {
+  h1 { font-size: 36px; }
+  main { padding: 40px 18px; }
+  .stats-row { flex-wrap: wrap; gap: 20px; }
+  .stat-item { flex: 1 1 40%; }
+  .setup-status,
+  .recording-status { flex-direction: column; align-items: stretch; }
+  .button-row { width: 100%; }
+  .button-row .btn { flex: 1; }
+}
+`;
